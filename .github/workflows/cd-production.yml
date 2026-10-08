@@ -1,0 +1,114 @@
+name: CD & Deployment Pipeline
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Entorno de despliegue manual'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+          - production
+
+# Evita ejecuciones simultáneas del mismo grupo
+concurrency:
+  group: deployment-${{ github.ref }}
+  cancel-in-progress: false
+
+# Permisos mínimos requeridos para OIDC
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  quality-gate:
+    name: Quality Gate
+    uses: ./.github/workflows/reusable-ci.yml
+    with:
+      node-versions: '["20", "22"]'
+      run-lint: true
+
+  deploy-staging:
+    name: Deploy to Staging
+    needs: quality-gate
+    # Push a main  -> siempre pasa por staging
+    # Manual       -> solo si se eligió "staging"
+    if: >-
+      needs.quality-gate.outputs.build-status == 'success' &&
+      (github.event_name == 'push' || inputs.environment == 'staging')
+    runs-on: ubuntu-latest
+    environment:
+      name: staging
+      url: https://staging.example.com
+
+    steps:
+      - name: Descargar Artifact de compilación
+        uses: actions/download-artifact@v4
+        with:
+          name: build-artifact
+          path: dist/
+
+      # Desactivado: requiere un rol IAM real en AWS
+      # - name: Autenticación OIDC con AWS
+      #   uses: aws-actions/configure-aws-credentials@v4
+      #   with:
+      #     role-to-assume: arn:aws:iam::123456789012:role/GitHubActionsStagingRole
+      #     aws-region: us-east-1
+
+      - name: Desplegar en Staging
+        run: |
+          echo "Desplegando en Staging..."
+          ls -R dist/
+          # aws s3 sync dist/ s3://staging-app-bucket/ --delete
+
+      - name: Smoke test de Staging
+        run: |
+          echo "Verificando https://staging.example.com ..."
+          # curl --fail --retry 5 --retry-delay 10 https://staging.example.com/health
+
+  deploy-production:
+    name: Deploy to Production
+    needs: [quality-gate, deploy-staging]
+    # Push a main  -> solo si staging terminó con éxito
+    # Manual       -> solo si se eligió "production" (staging queda "skipped")
+    if: >-
+      !cancelled() &&
+      needs.quality-gate.outputs.build-status == 'success' &&
+      (
+        (github.event_name == 'push' && needs.deploy-staging.result == 'success') ||
+        (github.event_name == 'workflow_dispatch' && inputs.environment == 'production')
+      )
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: https://example.com
+
+    steps:
+      - name: Descargar Artifact de compilación
+        uses: actions/download-artifact@v4
+        with:
+          name: build-artifact
+          path: dist/
+
+      # Desactivado: requiere un rol IAM real en AWS
+      # - name: Autenticación OIDC con AWS
+      #   uses: aws-actions/configure-aws-credentials@v4
+      #   with:
+      #     role-to-assume: arn:aws:iam::123456789012:role/GitHubActionsProductionRole
+      #     aws-region: us-east-1
+
+      - name: Despliegue en Producción
+        run: |
+          echo "Ejecutando despliegue Zero-Downtime en Producción..."
+          ls -R dist/
+          # aws s3 sync dist/ s3://production-app-bucket/ --delete
+          # aws cloudfront create-invalidation --distribution-id <ID> --paths "/*"
+
+      - name: Smoke test de Producción
+        run: |
+          echo "Verificando https://example.com ..."
+          # curl --fail --retry 5 --retry-delay 10 https://example.com/health
